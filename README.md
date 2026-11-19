@@ -121,6 +121,7 @@ epl-contribution-forecast/
 │   ├── baselines.py
 │   ├── train.py
 │   └── evaluate.py
+├── tests/
 ├── notebooks/             # exploration only
 ├── results/
 ├── requirements.txt
