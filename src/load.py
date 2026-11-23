@@ -1,60 +1,35 @@
-"""Read the raw FootyStats files and lineup files into clean tables.
+# Turn the raw API json files into 3 clean tables (csv)
+#
+# How to run (in the project folder):
+#   python3 -m src.load
+#
+# Output (git ignores this folder):
+#   data/processed/matches.csv          one row per match
+#   data/processed/appearances.csv      one row per player per match
+#   data/processed/player_seasons.csv   one row per player per season
 
-Nothing here computes features. The loaders only rename columns, map team
-names, build keys and check that each season is complete. Feature code in
-later stages decides what is known before each match.
-
-Run ``python -m src.load`` to print which seasons are available.
-"""
-
-from __future__ import annotations
-
-import argparse
+import os
 import re
-import sys
-from pathlib import Path
-
-import numpy as np
+import json
+import glob
+import unicodedata
 import pandas as pd
 
-from .names import canonical_teams, make_player_id, normalize_name
+API_DIR = "data/raw/api"
+CSV_DIR = "data/raw"  # old FootyStats csv files from V1, only used to fill gaps
+OUT_DIR = "data/processed"
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-RAW_DIR = PROJECT_ROOT / "data" / "raw"
-
-SEASONS = ("2020-2021", "2021-2022", "2022-2023", "2023-2024", "2024-2025")
-
-_FILE_RE = re.compile(
-    r"england-premier-league-(?P<kind>matches|players)-(?P<start>\d{4})-to-(?P<end>\d{4})-stats\.csv$"
-)
-
-#: Raw match columns kept, with their clean names.
-MATCH_COLUMNS = {
-    "timestamp": "timestamp",
-    "status": "status",
-    "Game Week": "matchweek",
-    "home_team_name": "home_team",
-    "away_team_name": "away_team",
-    "home_team_goal_count": "home_goals",
-    "away_team_goal_count": "away_goals",
-    # Bookmaker odds, kept only as a reference point for evaluation.
-    "odds_ft_home_team_win": "odds_home",
-    "odds_ft_draw": "odds_draw",
-    "odds_ft_away_team_win": "odds_away",
+SEASONS = {
+    "2020-2021": 4759,
+    "2021-2022": 6135,
+    "2022-2023": 7704,
+    "2023-2024": 9660,
+    "2024-2025": 12325,
+    "2025-2026": 15050,
 }
 
-#: Raw player columns kept, with their clean names. Season totals only;
-#: per-90 rates are computed later from these and ``minutes``.
-PLAYER_COLUMNS = {
-    "full_name": "full_name",
-    "birthday": "birthday",
-    "position": "position",
-    "Current Club": "team",
-    "minutes_played_overall": "minutes",
-    "appearances_overall": "appearances",
-    "games_started": "starts",
-    "goals_overall": "goals",
-    "assists_overall": "assists",
+# detailed stats we need (same names in the API and in the old csv files)
+DETAILED = {
     "shots_total_overall": "shots",
     "xg_total_overall": "xg",
     "key_passes_total_overall": "key_passes",
@@ -63,259 +38,240 @@ PLAYER_COLUMNS = {
     "clearances_total_overall": "clearances",
     "aerial_duels_won_total_overall": "aerials_won",
     "saves_total_overall": "saves",
-    "clean_sheets_overall": "clean_sheets",
-    "conceded_overall": "goals_conceded",
 }
 
-LINEUP_COLUMNS = ("date", "team", "player_name")
-
-POSITIONS = ("Goalkeeper", "Defender", "Midfielder", "Forward")
-
-
-def find_raw_files(raw_dir: Path = RAW_DIR) -> dict[str, dict[str, Path]]:
-    """Map ``kind -> season -> path`` for FootyStats files in ``raw_dir``."""
-    found: dict[str, dict[str, Path]] = {"matches": {}, "players": {}}
-    for path in sorted(Path(raw_dir).glob("*.csv")):
-        m = _FILE_RE.search(path.name)
-        if m:
-            season = f"{m['start']}-{m['end']}"
-            found[m["kind"]][season] = path
-    return found
-
-
-def _select_seasons(files: dict[str, Path], seasons, kind: str) -> dict[str, Path]:
-    if seasons is None:
-        return files
-    missing = [s for s in seasons if s not in files]
-    if missing:
-        raise FileNotFoundError(
-            f"No {kind} file for seasons {missing}. See data/README.md."
-        )
-    return {s: files[s] for s in seasons}
+# FootyStats marks some players as "Coach" (they became coaches later)
+# real positions checked with the old V1 csv files
+POSITION_FIX = {
+    17552: "Defender",    # Maxime Le Marchand
+    4068: "Forward",      # Shane Long
+    1728: "Defender",     # Christian Fuchs
+    8329: "Forward",      # Billy Sharp
+    7332: "Midfielder",   # Conor Hourihane
+    2965: "Defender",     # Shkodran Mustafi
+    4022: "Midfielder",   # Tom Cleverley
+    2901: "Defender",     # Felipe Augusto
+    7270: "Defender",     # Lewis Dunk
+}
 
 
-def _slug(text: str) -> str:
-    return normalize_name(text).replace(" ", "-")
+def load_json(path):
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
 
 
-# ---------------------------------------------------------------------------
-# Matches
-# ---------------------------------------------------------------------------
+def read_pages(folder, name):
+    # join all saved pages (matches_page1.json, matches_page2.json ...) into one list
+    rows = []
+    for path in sorted(glob.glob(f"{folder}/{name}_page*.json")):
+        rows += load_json(path)["data"]
+    return rows
 
 
-def load_matches(raw_dir: Path = RAW_DIR, seasons=None) -> pd.DataFrame:
-    """One row per completed league match, sorted by kickoff.
-
-    Columns: ``match_id, season, kickoff_utc, date, matchweek, home_team,
-    away_team, home_goals, away_goals, result, odds_home, odds_draw,
-    odds_away``. ``date`` is the local (London) calendar date, which is what
-    lineup sources use. ``result`` is ``H``, ``D`` or ``A``.
-    """
-    files = _select_seasons(find_raw_files(raw_dir)["matches"], seasons, "match")
-    if not files:
-        raise FileNotFoundError(f"No match files in {raw_dir}. See data/README.md.")
-
-    frames = []
-    for season, path in files.items():
-        raw = pd.read_csv(path)
-        missing = set(MATCH_COLUMNS) - set(raw.columns)
-        if missing:
-            raise ValueError(f"{path.name} is missing columns {sorted(missing)}")
-        df = raw[list(MATCH_COLUMNS)].rename(columns=MATCH_COLUMNS)
-        df.insert(0, "season", season)
-        frames.append(df)
-    df = pd.concat(frames, ignore_index=True)
-
-    df = df[df["status"] == "complete"].drop(columns="status")
-    df["kickoff_utc"] = pd.to_datetime(df["timestamp"], unit="s", utc=True)
-    df["date"] = df["kickoff_utc"].dt.tz_convert("Europe/London").dt.date
-    df["home_team"] = canonical_teams(df["home_team"])
-    df["away_team"] = canonical_teams(df["away_team"])
-    df["home_goals"] = df["home_goals"].astype(int)
-    df["away_goals"] = df["away_goals"].astype(int)
-    df["result"] = np.select(
-        [df["home_goals"] > df["away_goals"], df["home_goals"] < df["away_goals"]],
-        ["H", "A"],
-        default="D",
-    )
-    # FootyStats uses 0 for missing odds.
-    for col in ("odds_home", "odds_draw", "odds_away"):
-        df[col] = df[col].where(df[col] > 0)
-
-    df["match_id"] = [
-        f"{d:%Y%m%d}_{_slug(h)}_{_slug(a)}"
-        for d, h, a in zip(df["date"], df["home_team"], df["away_team"])
-    ]
-    cols = [
-        "match_id", "season", "kickoff_utc", "date", "matchweek",
-        "home_team", "away_team", "home_goals", "away_goals", "result",
-        "odds_home", "odds_draw", "odds_away",
-    ]
-    df = df[cols].sort_values(["kickoff_utc", "match_id"]).reset_index(drop=True)
-    if df["match_id"].duplicated().any():
-        dups = df.loc[df["match_id"].duplicated(keep=False), "match_id"].tolist()
-        raise ValueError(f"Duplicate match ids: {dups[:5]}")
-    return df
+def clean_name(name):
+    # "Martin Ødegaard" -> "martin odegaard" (to match names in the old csv)
+    name = str(name)
+    for a, b in [("ø", "o"), ("Ø", "O"), ("ł", "l"), ("Ł", "L"), ("đ", "d"), ("Đ", "D"), ("ß", "ss")]:
+        name = name.replace(a, b)
+    name = unicodedata.normalize("NFKD", name)
+    name = "".join(c for c in name if not unicodedata.combining(c))
+    name = re.sub(r"[^a-z0-9]+", " ", name.lower())
+    return name.strip()
 
 
-def validate_matches(matches: pd.DataFrame) -> list[str]:
-    """Return problems that would make a season incomplete or inconsistent."""
-    issues = []
-    for season, g in matches.groupby("season"):
-        teams = pd.concat([g["home_team"], g["away_team"]])
-        if len(g) != 380:
-            issues.append(f"{season}: {len(g)} completed matches, expected 380")
-        if teams.nunique() != 20:
-            issues.append(f"{season}: {teams.nunique()} teams, expected 20")
-        games = teams.value_counts()
-        odd = games[games != 38]
-        if len(odd):
-            issues.append(f"{season}: teams without 38 matches: {odd.to_dict()}")
-        pairs = g.groupby(["home_team", "away_team"]).size()
-        if (pairs > 1).any():
-            issues.append(f"{season}: repeated home/away pairings: {pairs[pairs > 1].index.tolist()}")
-    return issues
+def to_minute(text):
+    # "46'" -> 46, "90+3'" -> 90, "-1" -> None
+    text = str(text).strip().replace("'", "")
+    if text == "" or text.startswith("-"):
+        return None
+    return int(text.split("+")[0])
 
 
-# ---------------------------------------------------------------------------
-# Players
-# ---------------------------------------------------------------------------
-
-
-def load_players(raw_dir: Path = RAW_DIR, seasons=None, min_minutes: int = 1) -> pd.DataFrame:
-    """One row per player and season, with season totals.
-
-    Players below ``min_minutes`` are dropped. FootyStats lists the whole
-    registered squad, so many rows have zero league minutes; keeping them
-    would also create false name clashes during lineup matching.
-    """
-    files = _select_seasons(find_raw_files(raw_dir)["players"], seasons, "player")
-    if not files:
-        raise FileNotFoundError(f"No player files in {raw_dir}. See data/README.md.")
-
-    frames = []
-    for season, path in files.items():
-        raw = pd.read_csv(path)
-        missing = set(PLAYER_COLUMNS) - set(raw.columns)
-        if missing:
-            raise ValueError(f"{path.name} is missing columns {sorted(missing)}")
-        df = raw[list(PLAYER_COLUMNS)].rename(columns=PLAYER_COLUMNS)
-        df.insert(0, "season", season)
-        frames.append(df)
-    df = pd.concat(frames, ignore_index=True)
-
-    df = df[df["minutes"] >= min_minutes].copy()
-    unknown_pos = set(df["position"]) - set(POSITIONS)
-    if unknown_pos:
-        raise ValueError(f"Unknown positions: {sorted(unknown_pos)}")
-    df["team"] = canonical_teams(df["team"])
-    df["player_id"] = [make_player_id(n, b) for n, b in zip(df["full_name"], df["birthday"])]
-    df["name_norm"] = df["full_name"].map(normalize_name)
-    df = df.drop(columns="birthday")
-
-    if df.duplicated(["season", "player_id"]).any():
-        dups = df.loc[df.duplicated(["season", "player_id"], keep=False), ["season", "full_name", "team"]]
-        raise ValueError(f"Player listed twice in one season:\n{dups}")
-
-    front = ["season", "player_id", "full_name", "name_norm", "team", "position"]
-    return df[front + [c for c in df.columns if c not in front]].reset_index(drop=True)
-
-
-# ---------------------------------------------------------------------------
-# Lineups
-# ---------------------------------------------------------------------------
-
-
-def load_lineups(lineup_dir: Path = RAW_DIR / "lineups") -> pd.DataFrame:
-    """Read every CSV in ``lineup_dir``: one row per player in a match lineup.
-
-    Required columns are ``date``, ``team`` and ``player_name``. An optional
-    ``started`` column (1 for starters, 0 for substitutes) is kept. See
-    data/README.md for the format.
-    """
-    paths = sorted(Path(lineup_dir).glob("*.csv"))
-    if not paths:
-        raise FileNotFoundError(f"No lineup files in {lineup_dir}. See data/README.md.")
-    frames = []
-    for path in paths:
-        df = pd.read_csv(path)
-        missing = set(LINEUP_COLUMNS) - set(df.columns)
-        if missing:
-            raise ValueError(f"{path.name} is missing columns {sorted(missing)}")
-        keep = list(LINEUP_COLUMNS) + (["started"] if "started" in df.columns else [])
-        frames.append(df[keep].assign(source_file=path.name))
-    df = pd.concat(frames, ignore_index=True)
-    df["date"] = pd.to_datetime(df["date"]).dt.date
-    df["team"] = canonical_teams(df["team"])
-    df["player_name"] = df["player_name"].astype(str).str.strip()
-    if "started" not in df.columns:
-        df["started"] = 1
-    return df.drop_duplicates(["date", "team", "player_name"]).reset_index(drop=True)
-
-
-def attach_matches(lineups: pd.DataFrame, matches: pd.DataFrame) -> pd.DataFrame:
-    """Add ``match_id``, ``season`` and ``side`` (home/away) to lineup rows.
-
-    A lineup row joins a match when its date and team equal the match date and
-    either the home or away team. Rows that join no match keep ``match_id``
-    as missing so they can be reported, not silently dropped.
-    """
-    keys = ["match_id", "season", "date"]
-    home = matches[keys + ["home_team"]].rename(columns={"home_team": "team"}).assign(side="home")
-    away = matches[keys + ["away_team"]].rename(columns={"away_team": "team"}).assign(side="away")
-    sides = pd.concat([home, away], ignore_index=True)
-    if sides.duplicated(["date", "team"]).any():
-        raise ValueError("A team has two matches on the same date")
-    return lineups.merge(sides, on=["date", "team"], how="left", validate="many_to_one")
-
-
-# ---------------------------------------------------------------------------
-# Coverage report
-# ---------------------------------------------------------------------------
-
-
-def coverage(raw_dir: Path = RAW_DIR) -> pd.DataFrame:
-    """Rows available per season for each source."""
-    files = find_raw_files(raw_dir)
-    lineup_dir = Path(raw_dir) / "lineups"
-    lineup_counts: dict[str, int] = {}
-    if lineup_dir.is_dir() and any(lineup_dir.glob("*.csv")) and files["matches"]:
-        joined = attach_matches(load_lineups(lineup_dir), load_matches(raw_dir))
-        lineup_counts = joined.dropna(subset=["match_id"]).groupby("season")["match_id"].nunique().to_dict()
-
+def build_matches():
     rows = []
     for season in SEASONS:
-        m = files["matches"].get(season)
-        p = files["players"].get(season)
-        rows.append(
-            {
+        for m in read_pages(f"{API_DIR}/{season}", "matches"):
+            if m["status"] != "complete":
+                continue
+
+            if m["homeGoalCount"] > m["awayGoalCount"]:
+                result = "H"
+            elif m["homeGoalCount"] < m["awayGoalCount"]:
+                result = "A"
+            else:
+                result = "D"
+
+            rows.append({
+                "match_id": m["id"],
                 "season": season,
-                "matches": len(load_matches(raw_dir, [season])) if m else 0,
-                "players": len(load_players(raw_dir, [season])) if p else 0,
-                "matches_with_lineups": lineup_counts.get(season, 0),
+                "date_unix": m["date_unix"],
+                "game_week": m["game_week"],
+                "home_team_id": m["homeID"],
+                "home_team": m["home_name"],
+                "away_team_id": m["awayID"],
+                "away_team": m["away_name"],
+                "home_goals": m["homeGoalCount"],
+                "away_goals": m["awayGoalCount"],
+                "result": result,
+                # odds are only for reference, not used as features
+                "odds_home": m["odds_ft_1"],
+                "odds_draw": m["odds_ft_x"],
+                "odds_away": m["odds_ft_2"],
+            })
+
+    df = pd.DataFrame(rows)
+    # unix time -> date in UK time
+    df["date"] = pd.to_datetime(df["date_unix"], unit="s", utc=True).dt.tz_convert("Europe/London").dt.date
+    # 0 odds means no data
+    for col in ["odds_home", "odds_draw", "odds_away"]:
+        df.loc[df[col] <= 0, col] = None
+    df = df.sort_values(["date_unix", "match_id"]).reset_index(drop=True)
+
+    first = ["match_id", "season", "date"]
+    return df[first + [c for c in df.columns if c not in first]]
+
+
+def build_appearances(matches):
+    rows = []
+    for m in matches.itertuples():
+        d = load_json(f"{API_DIR}/{m.season}/match_details/{m.match_id}.json")["data"]
+
+        # in the API, team_a = home team and team_b = away team
+        for side, key, team_id in [("home", "team_a", m.home_team_id), ("away", "team_b", m.away_team_id)]:
+
+            # read the subs: who came off and who came on, and when
+            minute_out = {}
+            subs_in = []
+            for b in d["bench"][key]:
+                if b["player_out_id"] == -1:
+                    continue  # stayed on the bench
+                t = to_minute(b["player_out_time"])
+                minute_out[b["player_out_id"]] = t
+                subs_in.append((b["player_in_id"], t))
+
+            base = {"match_id": m.match_id, "season": m.season, "date": m.date, "team_id": team_id, "side": side}
+
+            # starters play from minute 0 until they are subbed off (or 90)
+            for p in d["lineups"][key]:
+                row = dict(base)
+                row["player_id"] = p["player_id"]
+                row["started"] = 1
+                row["minute_in"] = 0
+                row["minute_out"] = minute_out.get(p["player_id"], 90)
+                rows.append(row)
+
+            # subs play from when they came on until the end (or until subbed off)
+            for pid, t in subs_in:
+                row = dict(base)
+                row["player_id"] = pid
+                row["started"] = 0
+                row["minute_in"] = t
+                row["minute_out"] = minute_out.get(pid, 90)
+                rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+def build_player_seasons():
+    # detailed stats from the old csv files, key = (season, name, birthday)
+    csv_stats = {}
+    for season in SEASONS:
+        path = f"{CSV_DIR}/england-premier-league-players-{season[:4]}-to-{season[5:]}-stats.csv"
+        if not os.path.exists(path):
+            continue
+        old = pd.read_csv(path)
+        for r in old.to_dict("records"):
+            if r["minutes_played_overall"] > 0 and not pd.isna(r["tackles_total_overall"]):
+                csv_stats[(season, clean_name(r["full_name"]), int(r["birthday"]))] = r
+
+    rows = []
+    for season, season_id in SEASONS.items():
+        for p in read_pages(f"{API_DIR}/{season}", "players"):
+            if not p["minutes_played_overall"]:
+                continue  # never played
+
+            position = POSITION_FIX.get(p["id"], p["position"])
+            if position == "Coach":
+                print(f"  skipped, position is 'Coach': {season} {p['known_as']}")
+                continue
+
+            row = {
+                "season": season,
+                "player_id": p["id"],
+                "name": p["known_as"],
+                "full_name": p["full_name"],
+                "birthday": p["birthday"],
+                "position": position,
+                "team_id": p["club_team_id"],
+                "minutes": p["minutes_played_overall"],
+                "appearances": p["appearances_overall"],
+                "goals": p["goals_overall"],
+                "assists": p["assists_overall"],
+                "clean_sheets": p["clean_sheets_overall"],
+                "conceded": p["conceded_overall"],
             }
-        )
-    return pd.DataFrame(rows).set_index("season")
+
+            # 1st choice: detailed stats from the API (row of this EPL season)
+            detailed = None
+            path = f"{API_DIR}/player_stats/{p['id']}.json"
+            if os.path.exists(path):
+                for r in load_json(path)["data"]:
+                    if r["competition_id"] == season_id and isinstance(r.get("detailed"), dict):
+                        detailed = r["detailed"]
+            source = "api"
+
+            # sometimes the API has no detailed stats -> 2nd choice: old csv
+            # (goalkeepers have no tackles, so check saves for them)
+            check = "saves_total_overall" if position == "Goalkeeper" else "tackles_total_overall"
+            if detailed is None or detailed.get(check) is None:
+                detailed = csv_stats.get((season, clean_name(p["full_name"]), int(p["birthday"] or 0)))
+                source = "csv"
+            if detailed is None:
+                detailed = {}
+                source = "missing"
+
+            for long_name, short_name in DETAILED.items():
+                row[short_name] = detailed.get(long_name)
+            row["stats_source"] = source
+            rows.append(row)
+
+    return pd.DataFrame(rows)
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Report which raw data is available.")
-    parser.add_argument("--raw-dir", type=Path, default=RAW_DIR)
-    args = parser.parse_args(argv)
+def print_checks(matches, apps, players):
+    print("\n----- checks -----")
+    print("matches per season:")
+    print(matches.groupby("season").size().to_string())
 
-    table = coverage(args.raw_dir)
-    print(table.to_string())
-    issues = []
-    if (table["matches"] > 0).any():
-        issues = validate_matches(load_matches(args.raw_dir))
-    for issue in issues:
-        print("WARNING:", issue)
+    starters = apps[apps["started"] == 1]
+    per_team = starters.groupby(["match_id", "side"]).size()
+    print(f"\nteams without 11 starters: {(per_team != 11).sum()}")
+    print(f"subs with unknown minute: {apps['minute_in'].isna().sum()}")
 
-    missing = table.index[(table[["matches", "players", "matches_with_lineups"]] == 0).any(axis=1)]
-    if len(missing):
-        print(f"\nIncomplete seasons: {', '.join(missing)}. See data/README.md.")
-    return 0
+    # how many starts have detailed stats for that season?
+    s = starters.merge(players[["season", "player_id", "stats_source"]], on=["season", "player_id"], how="left")
+    s["stats_source"] = s["stats_source"].fillna("no player row")
+    print("\nstarts by stats source (% of starts in each season):")
+    print((pd.crosstab(s["season"], s["stats_source"], normalize="index") * 100).round(1).to_string())
+
+
+def main():
+    os.makedirs(OUT_DIR, exist_ok=True)
+
+    print("building matches...")
+    matches = build_matches()
+    print("building appearances... (reads 2280 files, takes a bit)")
+    apps = build_appearances(matches)
+    print("building player seasons...")
+    players = build_player_seasons()
+
+    matches.to_csv(f"{OUT_DIR}/matches.csv", index=False)
+    apps.to_csv(f"{OUT_DIR}/appearances.csv", index=False)
+    players.to_csv(f"{OUT_DIR}/player_seasons.csv", index=False)
+    print(f"\nsaved to {OUT_DIR}: matches {len(matches)}, appearances {len(apps)}, player_seasons {len(players)}")
+
+    print_checks(matches, apps, players)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

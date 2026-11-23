@@ -31,12 +31,13 @@ At that stage, the focus was on building features and comparing models. Evaluati
 |---|---|---|
 | Contribution metrics | AC, DC, MI with hand-set weights | Same metrics kept, plus a comparison with learned weights |
 | Feature timing | Full-season statistics | Previous-season statistics and past matches only |
-| Data size | About 270 matches | All 5 seasons, about 1,900 matches |
-| Train/test split | Random 80/20 | Time-based, test on the latest season |
+| Data source | FootyStats CSV exports and separate lineup files | FootyStats API: results, lineups, and player stats linked by player ID |
+| Data size | About 270 matches | 5 seasons (2021/22 to 2025/26), 1,900 matches |
+| Train/test split | Random 80/20 | Time-based, test on the latest season (2025/26) |
 | Baselines | None | Always home win, pre-match PPG, recent form |
 | Metrics | Accuracy only | Accuracy, macro F1, log loss, RPS |
 | Main question | How accurate is the model? | Do contribution features add value over baselines? |
-| Code | Single Colab notebook | Modular Python package, reproducible runs |
+| Code | Single Colab notebook | Python scripts, reproducible runs |
 | Deployment | None | Planned AWS pipeline |
 
 The accuracy in Version 2 may be lower than 57.4%. That would not mean the project went backward. It would mean the new number is closer to what the model can actually do.
@@ -69,8 +70,9 @@ The metric design comes from the original study (framework by Jiheon Kim).
 - Players with no previous-season data receive a documented default value. Promoted teams are handled the same way.
 
 ### Evaluation design
-- **Data:** 2020/21 to 2024/25 seasons (about 1,900 matches).
-- **Split:** Train on earlier seasons and test on the most recent season. A rolling season-by-season evaluation is also reported.
+- **Data:** 2021/22 to 2025/26 seasons (1,900 matches).
+- **2020/21 is used only as history**, for previous-season statistics and past matches. It was played without fans, and it is the only season in the data where away wins (40.3%) outnumbered home wins (37.9%).
+- **Split:** Train on earlier seasons and test on the most recent season (2025/26). A rolling season-by-season evaluation is also reported.
 - **Metrics:** Accuracy, macro F1, log loss, and Ranked Probability Score (RPS).
 
 ### Baselines
@@ -98,30 +100,31 @@ The metric design comes from the original study (framework by Jiheon Kim).
 
 | | Version 1 | Version 2 |
 |---|---|---|
-| Test set | 54 matches, random split | TBD matches, latest season |
+| Test set | 54 matches, random split | 380 matches, 2025/26 season |
 | Best accuracy | 0.574 (Random Forest) | TBD |
 | Always home win | 0.500 | TBD |
 | Gain over baseline | +0.074 | TBD |
 
 ## Data
 
-Match and player statistics come from [FootyStats](https://footystats.org). The original study received permission to use the data for academic research. **Raw data is not included in this repository.** To reproduce the results, download the season files yourself and place them in `data/raw/` as described in `data/README.md`.
+Match results, lineups, and player statistics come from the [FootyStats API](https://footystats.org/api). Lineups and player statistics share the same player IDs, so no name matching is needed. **Raw and processed data are not included in this repository**, because FootyStats does not allow redistribution. To reproduce the results, you need your own API key. See `data/README.md` for the steps and for known data issues.
 
 ## Project Structure
 
 ```
 epl-contribution-forecast/
 ├── data/
-│   └── README.md          # how to obtain and place the raw files
+│   ├── README.md          # how to get the data, known data issues
+│   ├── raw/               # API responses (not included)
+│   └── processed/         # clean tables (not included)
 ├── src/
-│   ├── load.py            # read and merge raw files
-│   ├── names.py           # player and team name matching
-│   ├── contribution.py    # AC, DC, MI calculation
-│   ├── features.py        # pre-match feature building
-│   ├── baselines.py
-│   ├── train.py
-│   └── evaluate.py
-├── tests/
+│   ├── collect.py         # download raw data from the FootyStats API
+│   ├── load.py            # build clean tables from the raw data
+│   ├── contribution.py    # AC, DC, MI calculation (planned)
+│   ├── features.py        # pre-match feature building (planned)
+│   ├── baselines.py       # (planned)
+│   ├── train.py           # (planned)
+│   └── evaluate.py        # (planned)
 ├── notebooks/             # exploration only
 ├── results/
 ├── requirements.txt
@@ -132,13 +135,15 @@ epl-contribution-forecast/
 
 ```bash
 pip install -r requirements.txt
-python -m src.train --test-season 2024-2025
-python -m src.evaluate
+python3 -m src.collect     # download raw data (needs an API key in .env)
+python3 -m src.load        # build clean tables in data/processed/
 ```
+
+Training and evaluation commands will be added as those stages are completed.
 
 ## Roadmap
 
-- [ ] Rebuild the data pipeline and name matching
+- [x] Rebuild the data pipeline (FootyStats API: results, lineups, player stats)
 - [ ] Leakage-free contribution features
 - [ ] Baselines and ablation experiments
 - [ ] Learned vs hand-set weights

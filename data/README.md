@@ -1,60 +1,69 @@
 # Data
 
-Raw data is not included in this repository. The FootyStats files were provided for academic research, so each user downloads them separately. Everything under `data/raw/` is ignored by git.
+Raw and processed data are not included in this repository. Both come from FootyStats, which does not allow redistribution. Everything under `data/raw/` and `data/processed/` is ignored by git.
 
-Check what you have at any time:
+## 1. Get an API key
+
+1. Subscribe to the [FootyStats API](https://footystats.org/api). The Hobby plan is enough. Select **England Premier League** as one of your leagues.
+2. Create a file named `.env` in the project folder with one line:
+
+```
+FOOTYSTATS_API_KEY=your_key_here
+```
+
+`.env` is ignored by git, so the key is never uploaded.
+
+## 2. Download the raw data
 
 ```bash
-python -m src.load
+python3 -m src.collect --test   # quick check with a few requests
+python3 -m src.collect          # download everything
 ```
 
-This prints how many matches, players, and matches with lineups were found for each season, and warns if a season is incomplete.
+- Seasons 2020/21 to 2025/26.
+- About 3,700 requests in total. The Hobby plan allows 1,800 requests per hour, so the script waits about 2 seconds between requests. A full run takes about 2.5 hours.
+- Files that are already downloaded are skipped. If the run stops, run the same command again to continue.
 
-## 1. FootyStats season files
-
-Download the CSV exports from [FootyStats](https://footystats.org) for the English Premier League, seasons 2020/21 to 2024/25. Keep the original file names and place them directly in `data/raw/`:
-
-```
-data/raw/
-├── england-premier-league-matches-2020-to-2021-stats.csv
-├── ...
-├── england-premier-league-matches-2024-to-2025-stats.csv
-├── england-premier-league-players-2020-to-2021-stats.csv
-├── ...
-└── england-premier-league-players-2024-to-2025-stats.csv
-```
-
-The loader finds files by this name pattern, so other files in the folder are ignored.
-
-| File | Used for | Key columns |
+| API endpoint | Saved to | Contents |
 |---|---|---|
-| `matches-*` | Results, dates, baselines | `timestamp`, `home_team_name`, `away_team_name`, `home_team_goal_count`, `away_team_goal_count`, `status` |
-| `players-*` | AC and DC metrics | `full_name`, `birthday`, `position`, `Current Club`, `minutes_played_overall`, season totals |
+| `league-matches` | `data/raw/api/<season>/matches_page*.json` | Results, dates, odds |
+| `league-players` | `data/raw/api/<season>/players_page*.json` | Players and basic season stats |
+| `match` | `data/raw/api/<season>/match_details/<match_id>.json` | Starting XI, substitutions with times, goals, cards |
+| `player-stats` | `data/raw/api/player_stats/<player_id>.json` | Detailed stats for every season and competition of one player |
 
-Notes on the player files:
+**Optional:** the FootyStats CSV player exports used in Version 1 (`england-premier-league-players-YYYY-to-YYYY-stats.csv`, 2020/21 to 2024/25) can be placed in `data/raw/`. They are used only to fill gaps in the API data (see below).
 
-- `Current Club` is the club the player ended the season with. A player who moved in January is listed under the new club for the whole season.
-- Players with zero league minutes are dropped when loading.
-- Two different players can share a name in one season. Players are keyed by `player_id`, which is the normalised name plus date of birth, for example `ben-davies_19930424`.
+## 3. Build the clean tables
 
-## 2. Lineup files
-
-Contribution features need to know which players started each match. FootyStats season exports do not include lineups, so they come from a separate source. Place one or more CSV files in `data/raw/lineups/`, one row per player per match:
-
-| Column | Required | Example | Notes |
-|---|---|---|---|
-| `date` | yes | `2023-08-12` | Local match date |
-| `team` | yes | `Man City` | Short names are mapped automatically (see `TEAM_ALIASES` in `src/names.py`) |
-| `player_name` | yes | `D. Rice` | Full or abbreviated names both work |
-| `started` | no | `1` | 1 for starters, 0 for substitutes. Assumed 1 if missing |
-
-Lineup rows are joined to matches by date and team, then player names are matched to FootyStats players of the same season and team. Each match records which rule matched it (`exact_team`, `initial_surname`, `fuzzy`, and so on), so the share of uncertain matches can be reported.
-
-If a name cannot be matched automatically, add it to `data/name_aliases.csv`:
-
-```csv
-source_name,full_name,team
-Bernard,Bernard Anício Caldeira Duarte,Everton
+```bash
+python3 -m src.load
 ```
 
-`team` is optional. Leave it empty to apply the alias for every team.
+| File | One row per | Main columns |
+|---|---|---|
+| `data/processed/matches.csv` | Match (2,280) | `match_id`, `season`, `date`, home/away team, goals, `result` (H/D/A), odds |
+| `data/processed/appearances.csv` | Player in a match (66,624) | `match_id`, `team_id`, `side`, `player_id`, `started`, `minute_in`, `minute_out` |
+| `data/processed/player_seasons.csv` | Player in a season (3,281) | `player_id`, `position`, `minutes`, goals, assists, shots, xG, key passes, tackles, interceptions, clearances, aerial duels won, saves, clean sheets, conceded, `stats_source` |
+
+The script ends by printing checks: matches per season, teams without 11 starters, and how many starts have detailed stats.
+
+## Known data issues
+
+**Missing detailed stats.** For some player-seasons the API has no detailed stats (tackles, interceptions, key passes, and so on), even for regular starters. Missing values are filled from the Version 1 CSV exports when the same player (name and date of birth) is found there. The source is recorded in `stats_source`. Share of starts by source:
+
+| Season | API | CSV | Missing |
+|---|---|---|---|
+| 2020/21 | 97.7% | 0.6% | 1.7% |
+| 2021/22 | 98.6% | 0.5% | 0.9% |
+| 2022/23 | 97.6% | 0.7% | 1.7% |
+| 2023/24 | 93.1% | 3.2% | 3.6% |
+| 2024/25 | 91.9% | 3.7% | 4.4% |
+| 2025/26 | 99.5% | 0.0% | 0.5% |
+
+How missing values are handled in the features is decided in the contribution stage.
+
+**Wrong positions.** FootyStats lists 9 players who later became coaches with the position "Coach", even in seasons where they played. Their real positions are set in `POSITION_FIX` in `src/load.py`.
+
+**Approximate minutes.** Minutes in `appearances.csv` assume a 90-minute match. Stoppage time and red cards are ignored. MI only uses whether a player started, so this does not affect it.
+
+**Odds.** Bookmaker odds are kept for reference only and are not used as features.

@@ -4,6 +4,7 @@
 # Raw data is licensed for academic use only and is not redistributed.
 data/raw/
 data/interim/
+data/processed/
 
 # Python
 __pycache__/
